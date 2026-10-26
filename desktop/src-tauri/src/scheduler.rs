@@ -18,6 +18,10 @@ pub struct JobState {
     pub eta_secs: u64,
     pub is_playlist: bool,
     pub error: Option<String>,
+    /// Optional per-job connection count from the extension payload (`payload.threads`).
+    /// `download.rs` builds and reads this field; without it the crate does not compile.
+    #[serde(default)]
+    pub threads: Option<u32>,
     /// When true, start_engine downloads via yt-dlp merge instead of core_engine.
     #[serde(default)]
     pub merge_via_ytdlp: bool,

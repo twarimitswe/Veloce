@@ -29,6 +29,30 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Hard cap on `FORMAT_FAIL_CACHE`. This process is a long-lived tray app; without
+/// a bound the fail cache grows one entry per failed URL forever.
+const FORMAT_FAIL_CACHE_MAX: usize = 500;
+
+/// Record a soft-fail with an entry cap: sweep entries older than a day, then
+/// evict the single oldest if still full, before inserting.
+async fn record_format_fail(normalized: &str, reason: &str) {
+    let mut map = FORMAT_FAIL_CACHE.lock().await;
+    if map.len() >= FORMAT_FAIL_CACHE_MAX && !map.contains_key(normalized) {
+        let now = now_secs();
+        map.retain(|_, (_, ts)| now.saturating_sub(*ts) < 24 * 3600);
+        if map.len() >= FORMAT_FAIL_CACHE_MAX {
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, (_, ts))| *ts)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+    }
+    map.insert(normalized.to_string(), (reason.to_string(), now_secs()));
+}
+
 /// List formats with the same routing as the Tauri command (MediaFire, direct, GitHub, yt-dlp).
 pub async fn list_formats_for_url(
     state: &AppState,
@@ -193,10 +217,7 @@ async fn list_formats_uncached(
             {
                 Ok(formats) => formats,
                 Err(last_err) => {
-                    FORMAT_FAIL_CACHE
-                        .lock()
-                        .await
-                        .insert(normalized.to_string(), (last_err.clone(), now_secs()));
+                    record_format_fail(normalized, &last_err).await;
                     return Err(last_err);
                 }
             }
@@ -211,10 +232,7 @@ async fn list_formats_uncached(
 
     if formats.is_empty() {
         let reason = formats::fail_reason_for_source(source, None);
-        FORMAT_FAIL_CACHE
-            .lock()
-            .await
-            .insert(normalized.to_string(), (reason.clone(), now_secs()));
+        record_format_fail(normalized, &reason).await;
         return Err(reason);
     }
 

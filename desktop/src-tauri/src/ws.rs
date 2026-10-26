@@ -157,9 +157,23 @@ pub async fn start_ws_server(app: Arc<AppState>, clients: Arc<WsClients>, port: 
     // Startup reconciliation (backend parity)
     if let Ok(interrupted) = app.db.list_interrupted_downloads() {
         for row in interrupted {
+            // Only auto-resume rows that made real progress. A row with no bytes,
+            // no partial file and no resume sidecar is likely a job that fails
+            // immediately (dead URL, missing engine, bad cookies); re-running it on
+            // every startup just re-fails it. Surface it for a deliberate retry.
+            let made_progress = row.downloaded_bytes.unwrap_or(0) > 0
+                || crate::util::has_resume_state(Path::new(&row.save_path))
+                || Path::new(&row.save_path).exists();
+            if !made_progress {
+                log::info!("Interrupted download {} had no progress — marking for manual retry", row.id);
+                let _ = app.db.update_download_status(&row.id, "failed");
+                app.ws_clients
+                    .broadcast_error(&row.id, "Interrupted before any data downloaded — click Retry.");
+                continue;
+            }
             log::info!("Reconciling interrupted download on startup: {}", row.id);
             let _ = app.db.update_download_status(&row.id, "queued");
-            
+
             let job = crate::scheduler::JobState {
                 id: row.id.clone(),
                 url: row.url.clone(),

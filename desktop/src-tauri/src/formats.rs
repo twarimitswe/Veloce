@@ -90,7 +90,11 @@ struct CacheEntry {
     ts: Instant,
 }
 
-/// Format cache with TTL.
+/// Hard entry cap for `FormatCache` — this process is a long-lived tray app, so
+/// TTL alone lets the map grow one entry per URL until the next hit expires it.
+const FORMAT_CACHE_MAX_ENTRIES: usize = 500;
+
+/// Format cache with TTL + a hard entry cap.
 pub struct FormatCache {
     cache: Mutex<HashMap<String, CacheEntry>>,
     ttl: Duration,
@@ -114,6 +118,19 @@ impl FormatCache {
 
     pub fn set(&self, key: &str, url: &str) {
         let mut cache = self.cache.lock().unwrap();
+        if cache.len() >= FORMAT_CACHE_MAX_ENTRIES && !cache.contains_key(key) {
+            // Drop expired entries first, then the single oldest if still full.
+            cache.retain(|_, e| e.ts.elapsed() < self.ttl);
+            if cache.len() >= FORMAT_CACHE_MAX_ENTRIES {
+                if let Some(oldest) = cache
+                    .iter()
+                    .min_by_key(|(_, e)| e.ts)
+                    .map(|(k, _)| k.clone())
+                {
+                    cache.remove(&oldest);
+                }
+            }
+        }
         cache.insert(key.to_string(), CacheEntry {
             url: url.to_string(),
             ts: Instant::now(),
