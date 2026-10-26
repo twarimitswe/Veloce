@@ -98,7 +98,11 @@ impl IoUringEngine {
             pipe_wr,
             pipe_capacity,
             use_splice: true,
-            pending: Vec::with_capacity(BATCH_SIZE * 2),
+            // `write_at_owned` flushes at `len() >= BATCH_SIZE`, so the vec never
+            // exceeds BATCH_SIZE entries. Sizing the backing store to 2× just held
+            // an extra ~BATCH_SIZE × read_buffer_bytes of idle capacity per worker
+            // (≈ 2 MiB/worker at 64 threads × 256 KiB). One BATCH_SIZE is enough.
+            pending: Vec::with_capacity(BATCH_SIZE),
         }))
     }
 
