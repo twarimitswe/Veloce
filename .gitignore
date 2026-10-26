@@ -3,14 +3,19 @@ node_modules/
 .pnpm-store/
 
 # ── Build output ──────────────────────────────────────────────────────────────
-# Vite / SvelteKit (backend + extension + desktop)
+# Vite / SvelteKit (backend + extension + desktop) — unanchored so this matches
+# backend/.svelte-kit, extension/.svelte-kit, extension/build, desktop/dist, etc.,
+# not just a root-level directory of the same name.
 .output/
 .vercel/
 .netlify/
 .wrangler/
-/.svelte-kit/
-/build/
-/dist/
+.svelte-kit/
+build/
+dist/
+
+# Tauri-generated capability/ACL schemas (regenerated every build)
+**/gen/schemas/
 
 # Vite timestamps
 vite.config.js.timestamp-*
