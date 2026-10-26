@@ -67,6 +67,15 @@ const WS_PING_MS = 25000;
 /** True when the offscreen document (or legacy SW socket) is linked to the coordinator. */
 let useOffscreenWs = false;
 let coordinatorConnectInFlight = null;
+let offscreenHealthTimer = null;
+
+/** Backstop between user-triggered connectCoordinator() calls — the 1-min keepalive alarm alone can leave a dead offscreen socket undetected for up to 60s. */
+function startOffscreenHealthCheck() {
+	if (offscreenHealthTimer) return;
+	offscreenHealthTimer = setInterval(() => {
+		if (useOffscreenWs) void connectCoordinator();
+	}, WS_PING_MS);
+}
 
 function retireLegacySocket() {
 	if (!ws) return;
@@ -605,6 +614,7 @@ async function connectCoordinator() {
 	coordinatorConnectInFlight = (async () => {
 		const offscreen = await ensureOffscreenDocument();
 		if (offscreen) {
+			startOffscreenHealthCheck();
 			try {
 				const status = await chrome.runtime.sendMessage({ type: 'VELOCE_WS_STATUS' });
 				if (!status?.ready) {
@@ -807,12 +817,12 @@ async function requestFormatsFromCoordinator(url, sendResponse, prefetch = false
 	}
 	setTimeout(() => {
 		if (pendingFormatRequests.has(requestId)) {
-			traceFormats('WS TIMEOUT (50s)', { requestId, url: key, prefetch });
+			traceFormats('WS TIMEOUT (22s)', { requestId, url: key, prefetch });
 			inflightFormatUrls.delete(key);
 			pendingFormatRequests.delete(requestId);
 			sendResponse({ type: 'FORMATS_ERROR', error: 'Format list timed out' });
 		}
-	}, 50000);
+	}, 22000);
 }
 
 async function listFormats(url, sendResponse, sender, force = false) {

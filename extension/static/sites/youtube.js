@@ -463,19 +463,19 @@
 			cardIo.observe(card);
 		}
 
-		function scanFeedCardsVisible() {
+		function scanFeedCardsVisible(cards) {
 			if (!captureActive() || !isHost()) return;
-			const cards = queryFeedCards()
+			const visible = (cards || queryFeedCards())
 				.filter((card) => isNearViewport(card, BADGE_MARGIN_PX))
 				.sort((a, b) => cardViewportScore(a) - cardViewportScore(b));
-			for (const card of cards) {
+			for (const card of visible) {
 				watchFeedCard(card);
 				processFeedCard(card);
 			}
 		}
 
-		function scanFeedCards(watchBudgetRef) {
-			for (const card of queryFeedCards()) {
+		function scanFeedCards(watchBudgetRef, cards) {
+			for (const card of cards || queryFeedCards()) {
 				watchFeedCard(card);
 				if (watchBudgetRef.value <= 0) continue;
 				if (isNearViewport(card, BADGE_MARGIN_PX)) {
@@ -488,7 +488,9 @@
 		function scheduleScrollScan() {
 			if (!isHost()) return;
 			clearTimeout(scrollScanTimer);
-			scrollScanTimer = setTimeout(scanFeedCardsVisible, 120);
+			// Same debounce window as the mutation-driven scan path (getScanDebounceMs),
+			// so scroll- and mutation-triggered rescans no longer race on two different timings.
+			scrollScanTimer = setTimeout(scanFeedCardsVisible, getScanDebounceMs());
 		}
 
 		function resetCapture() {
@@ -549,8 +551,10 @@
 					eagerPrefetch(watchUrl);
 				}
 			}
-			scanFeedCards(watchBudgetRef);
-			scanFeedCardsVisible();
+			// Single tree walk shared by both passes instead of each querying independently.
+			const cards = queryFeedCards();
+			scanFeedCards(watchBudgetRef, cards);
+			scanFeedCardsVisible(cards);
 			return true;
 		}
 

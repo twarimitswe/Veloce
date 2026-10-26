@@ -31,6 +31,7 @@
 	let ig = null;
 	let omni = null;
 	let mf = null;
+	let tt = null;
 
 	function initSiteHandlers(ctx) {
 		siteHandlers = window.__veloceCreateSiteHandlers?.(ctx) || [];
@@ -38,6 +39,7 @@
 		ig = siteHandlers.find((h) => h.id === 'instagram') || null;
 		omni = siteHandlers.find((h) => h.id === 'omnisave') || null;
 		mf = siteHandlers.find((h) => h.id === 'mediafire') || null;
+		tt = siteHandlers.find((h) => h.id === 'tiktok') || null;
 	}
 
 	function isYoutubeHost() { return !!yt?.isHost?.(); }
@@ -936,7 +938,7 @@
 	}
 
 	/** True when the element is the media the user is actually looking at (not feed behind a modal). */
-	function isElementForeground(el) {
+	function isElementForeground(el, cachedOverlay) {
 		if (!el?.isConnected) return false;
 
 		for (const h of siteHandlers) {
@@ -948,7 +950,7 @@
 		const tag = el.tagName?.toLowerCase();
 		if (tag !== 'video' && tag !== 'audio' && tag !== 'a') return false;
 
-		const overlay = findMediaOverlay();
+		const overlay = cachedOverlay !== undefined ? cachedOverlay : findMediaOverlay();
 		if (overlay) {
 			if (!overlay.contains(el)) return false;
 		} else if (isSocialFeedPage()) {
@@ -991,8 +993,8 @@
 	}
 
 	/** Drop badges tied to feed tiles when a modal/overlay player is open. */
-	function cullBackgroundBadges() {
-		const overlay = findMediaOverlay();
+	function cullBackgroundBadges(cachedOverlay) {
+		const overlay = cachedOverlay !== undefined ? cachedOverlay : findMediaOverlay();
 		for (const [key, entry] of [...badges]) {
 			if (!entry.anchor?.isConnected) {
 				removeBadge(key);
@@ -1003,7 +1005,7 @@
 				removeBadge(key);
 				continue;
 			}
-			if (!isElementForeground(entry.anchor)) {
+			if (!isElementForeground(entry.anchor, overlay)) {
 				entry.el.style.display = 'none';
 			} else {
 				entry.el.style.display = '';
@@ -1404,15 +1406,20 @@
 		badgeLayoutQueued = true;
 		requestAnimationFrame(() => {
 			badgeLayoutQueued = false;
-			cullBackgroundBadges();
+			const overlay = findMediaOverlay();
+			cullBackgroundBadges(overlay);
+
+			// Read pass: resolve foreground state + target rect for every badge before touching the DOM.
+			const plans = [];
 			for (const [, entry] of badges) {
-				const { el } = entry;
 				if (!entry.anchor?.isConnected) continue;
-				if (!isElementForeground(entry.anchor)) {
-					el.style.display = 'none';
-					continue;
-				}
-				const rect = layoutRectForEntry(entry);
+				const foreground = isElementForeground(entry.anchor, overlay);
+				const rect = foreground ? layoutRectForEntry(entry) : null;
+				plans.push({ el: entry.el, rect });
+			}
+
+			// Write pass: apply all style mutations together.
+			for (const { el, rect } of plans) {
 				if (!rect) {
 					el.style.display = 'none';
 					continue;
@@ -2107,7 +2114,7 @@
 		e.preventDefault();
 		e.stopPropagation();
 		const pageUrl = location.href.split('#')[0];
-		const preloaded = a.hasAttribute('download')
+		const preloaded = (a.hasAttribute('download') || FILE_EXT.test(href)) && !isInterceptTrapUrl(href)
 			? (omni?.renameInterceptFormats?.(formatsFromDownloadAnchor(a)) || formatsFromDownloadAnchor(a))
 			: null;
 		const listUrl = resolveInterceptListUrl(pageUrl, resolveDownloadUrl(href, a) || href);
@@ -2144,6 +2151,11 @@
 			for (const m of batch) {
 				for (const node of m.addedNodes) {
 					if (node.nodeType === 1) addedNodes.push(node);
+				}
+				// Feed virtualization (YouTube/Instagram infinite scroll) detaches cards
+				// outright; unobserve them so mediaIo/cardIo/igCardIo don't hold dead refs.
+				for (const node of m.removedNodes) {
+					if (node.nodeType === 1) resetScanStateDeep(node);
 				}
 			}
 			let handled = false;
@@ -2250,6 +2262,7 @@
 	ig?.hookNavigation?.();
 	yt?.hookNavigation?.();
 	mf?.hookNavigation?.();
+	tt?.hookNavigation?.();
 
 	if (!document.hidden) scan();
 	const observer = new MutationObserver((mutations) => {

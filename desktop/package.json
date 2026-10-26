@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "pnpm tauri dev --config src-tauri/tauri.dev.conf.json",
-    "start": "pnpm build && cd src-tauri && RUST_LOG=info cargo run",
-    "build": "vite build",
+    "dev": "node init && pnpm tauri dev --config src-tauri/tauri.dev.conf.json",
+    "start": "node init && pnpm build && cd src-tauri && RUST_LOG=info cargo run",
+    "build": "node init && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },

@@ -40,6 +40,8 @@
         "sites/registry.js",
         "sites/youtube.js",
         "sites/instagram.js",
+        "sites/tiktok.js",
+        "sites/twitter.js",
         "sites/omnisave.js",
         "sites/mediafire.js",
         "content.js"

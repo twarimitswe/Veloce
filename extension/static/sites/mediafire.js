@@ -151,11 +151,15 @@
 			lastBadgeKey = urlKey;
 
 			if (!shouldAttemptBadge?.(urlKey, anchor)) return null;
-			if (anchor.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) return url;
+			if (anchor.getAttribute(SCANNED_ATTR) && badges.has(urlKey)) {
+				stopFilePagePoll();
+				return url;
+			}
 
 			const placed = placeBadge(url, anchor, url, true);
 			if (!placed) return null;
 			anchor.setAttribute(SCANNED_ATTR, '1');
+			stopFilePagePoll();
 			return url;
 		}
 
@@ -170,6 +174,9 @@
 		function startFilePagePoll() {
 			if (filePagePoll) return;
 			if (!isFilePage()) return;
+			const url = canonicalFilePageUrl();
+			const anchor = url && findDownloadAnchor();
+			if (anchor?.getAttribute(SCANNED_ATTR) && badges.has(normalizeBadgeKey(url))) return;
 			filePagePoll = setInterval(() => {
 				if (!captureActive() || !isHost()) {
 					stopFilePagePoll();

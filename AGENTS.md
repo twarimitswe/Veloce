@@ -158,8 +158,8 @@ All three layers must use the **same normalized key** (`normalizeFormatUrl` / `n
 |---------------|-----------|----------------|---------------|-------|
 | YouTube | `youtube` | A | yt-dlp `-J` | Card-scoped watch URL; **watch page** badge on `#movie_player video`; SPA `v=` changes reset badges + prefetch focus; **no sidebar prefetch** on watch (main player only); radio `list=RD…` stripped to `watch?v=ID` |
 | Instagram | `instagram` | A | yt-dlp + cookies | **Feed:** `main article`. **Post/reel page** (`/p/ID`, `/reel/ID`): badge on main viewer `video` (URL from address bar). **Stories:** `/stories/user/ID`. Photo-only = no badge. **No prefetch** on feed. |
-| TikTok | `tiktok` | A | yt-dlp | |
-| X/Twitter | `twitter` | A | yt-dlp | |
+| TikTok | `tiktok` | A | yt-dlp | Dedicated handler `sites/tiktok.js`: card-scoped permalink anchor (not center hit-testing, which TikTok's overlay UI blocks); feed-scroll prefetch like YouTube sidebar |
+| X/Twitter | `twitter` | A | yt-dlp | Dedicated `sites/twitter.js` resolves `blob:`-sourced timeline/permalink video to the tweet's `/status/ID` URL |
 | MediaFire | `mediafire` | C | HTML scrape | Re-resolve each download |
 | OmniSave / videodownloader.site | — | D | Site API (XHR/fetch) | `inject-intercept.js` + modal |
 | MovieBox / netfilm.world | — | D | `subject/download` API | Same as OmniSave; player page + Download Options modal |
@@ -197,6 +197,26 @@ Agents working on a site should **inspect the live DOM** (DevTools → Elements,
 | Stories | `/stories/user/ID` | Largest story `video` | `/stories/user/ID` |
 
 **Prefetch:** Reels/post viewer only when reel **starts playing**; keep previous reel in prefetch window (2 slots).
+
+### TikTok (`extension/static/sites/tiktok.js`)
+
+| Page | DOM anchor | Badge target | Resolved URL |
+|------|------------|--------------|--------------|
+| For You / profile feed | `[data-e2e="recommend-list-item-container"]`, `[data-e2e="explore-item"]`, `[data-e2e="user-post-item"]`, or (markup-drift fallback) nearest ancestor holding exactly one `a[href*="/video/"]` | Card's `video` element | `https://www.tiktok.com/@user/video/ID` |
+| Video permalink page | `/@user/video/ID` | Main `video` | From address bar |
+
+**Badge anchor is resolved structurally** (walk to the card's own permalink `<a>`), never by hit-testing a point in the card — TikTok's like/comment/share rail and caption overlay sit over the center of the card and block point hit-testing (see "Feed tiles" note in `content.js` `isElementForeground`).
+
+**Prefetch:** feed cards get the standard scroll-near-viewport prefetch (same as YouTube sidebar); SPA route changes (`pushState`/`popstate`) reset badges and refocus prefetch on the new permalink via `tt?.hookNavigation?.()` (wired alongside the `yt`/`ig`/`mf` handlers in `content.js`).
+
+### X/Twitter (`extension/static/sites/twitter.js`)
+
+| Page | DOM anchor | Badge target | Resolved URL |
+|------|------------|--------------|--------------|
+| Timeline | `[data-testid="tweet"]` / `article[role="article"]` card | Card's `video` (blob-sourced) | `https://x.com/user/status/ID` (prefers the tweet's own timestamp-linked status anchor over a nested quote-tweet's) |
+| Single-tweet permalink | `/user/status/ID` | Main `video` | From address bar |
+
+**Badge anchor is resolved structurally** (walk up from the `<video>` to its tweet article, then find the best `a[href*="/status/"]` inside it — scored higher if it wraps a `<time>` element, to prefer the real tweet's timestamp link over a nested quote-tweet's), not by reading `video.src` — X streams via `blob:`/MSE so the element's own `src` is never the real media URL.
 
 ### MediaFire (`extension/static/sites/mediafire.js`)
 

@@ -9,6 +9,13 @@
 		let captions = [];
 		let movieTitle = '';
 		let pendingSubtitleLabel = '';
+		let pendingQualityLabel = '';
+		let qualityRetryGen = 0;
+		let subtitleRetryGen = 0;
+		let lastRawStorage = null;
+
+		const RETRY_POLL_MS = 300;
+		const RETRY_TIMEOUT_MS = 2500;
 
 		function isHost() {
 			const h = location.hostname.toLowerCase();
@@ -53,7 +60,8 @@
 		function loadFromStorage() {
 			try {
 				const raw = sessionStorage.getItem(STORAGE_KEY);
-				if (!raw) return;
+				if (!raw || raw === lastRawStorage) return;
+				lastRawStorage = raw;
 				const data = JSON.parse(raw);
 				if (Date.now() - (data.ts || 0) > 600000) return;
 				links = Array.isArray(data.links) ? data.links : [];
@@ -122,6 +130,11 @@
 			}];
 		}
 
+		function qualityLabelToResLabel(label) {
+			const digits = String(label || '').match(/(\d{3,4})/);
+			return digits ? `${digits[1]}p` : sanitizeFileStem(label || 'quality');
+		}
+
 		function renameInterceptFormats(formats, subtitleLabel) {
 			if (!formats?.length || !isHost()) return formats;
 			const title = resolveMediaTitle('');
@@ -137,6 +150,15 @@
 						...fmt,
 						label: `${lang} subtitle`,
 						fileName: `${title}_${lang}${ext}`
+					};
+				}
+				if (pendingQualityLabel) {
+					const resLabel = qualityLabelToResLabel(pendingQualityLabel);
+					const ext = fmt.ext || '.mp4';
+					return {
+						...fmt,
+						label: `${pendingQualityLabel} — ${ext.replace(/^\./, '').toUpperCase()}`,
+						fileName: `${title}_${resLabel}${ext}`
 					};
 				}
 				return fmt;
@@ -156,7 +178,50 @@
 					fileName: `${title}_${lang}${ext}`
 				}));
 			}
+			if (pendingQualityLabel) {
+				const resLabel = qualityLabelToResLabel(pendingQualityLabel);
+				const ext = formats[0].ext || '.mp4';
+				return formats.map((fmt) => ({
+					...fmt,
+					label: `${pendingQualityLabel} — ${ext.replace(/^\./, '').toUpperCase()}`,
+					fileName: `${title}_${resLabel}${ext}`
+				}));
+			}
 			return formats;
+		}
+
+		function retryLoadAndOpen(modalBtn, sectionKind, gen, startedAt) {
+			const current = sectionKind === 'quality' ? qualityRetryGen : subtitleRetryGen;
+			if (gen !== current) return;
+			loadFromStorage();
+			const movie = modalBtn.movie || movieTitle;
+			if (sectionKind === 'quality') {
+				const link = findQualityLink(modalBtn.label);
+				const formats = link ? formatFromQualityLink(link, modalBtn.label, movie) : null;
+				if (formats) {
+					interceptLog('step 2b: cached link arrived after wait — opening menu', formats[0]);
+					openFormatMenu(location.href.split('#')[0], modalBtn.btn, modalBtn.btn, formats);
+					return;
+				}
+			} else {
+				const caption = findCaption(modalBtn.label);
+				const formats = caption ? formatFromCaption(caption, modalBtn.label, movie) : null;
+				if (formats) {
+					interceptLog('step 2b: cached subtitle arrived after wait — opening menu', formats[0]);
+					openFormatMenu(location.href.split('#')[0], modalBtn.btn, modalBtn.btn, formats);
+					return;
+				}
+			}
+			if (Date.now() - startedAt >= RETRY_TIMEOUT_MS) {
+				if (sectionKind === 'quality') {
+					pendingQualityLabel = modalBtn.label || '';
+					showVeloceToast('Veloce: click the quality again once the download starts', true);
+				} else {
+					pendingSubtitleLabel = modalBtn.label || '';
+				}
+				return;
+			}
+			setTimeout(() => retryLoadAndOpen(modalBtn, sectionKind, gen, startedAt), RETRY_POLL_MS);
 		}
 
 		function parseDownloadModalButton(target) {
@@ -231,11 +296,16 @@
 					openFormatMenu(location.href.split('#')[0], modalBtn.btn, modalBtn.btn, formats);
 					return true;
 				}
-				interceptLog('step 1c: no cached link — open modal again or refresh tab after extension load', {
-					label: modalBtn.label,
-					hint: 'links load when Download Options modal opens (axios API)'
-				});
-				showVeloceToast('Veloce: reopen Download Options modal once, then click quality again', true);
+				if (!links.length) {
+					interceptLog('step 1c: cache empty — waiting for Download Options API response', { label: modalBtn.label });
+					retryLoadAndOpen(modalBtn, 'quality', ++qualityRetryGen, Date.now());
+				} else {
+					pendingQualityLabel = modalBtn.label || '';
+					interceptLog('step 1c: no cached link for label — falling back to anchor intercept', {
+						label: modalBtn.label,
+						qualities: links.map((l) => l.resolution ?? l.res)
+					});
+				}
 			}
 
 			if (modalBtn.sectionKind === 'subtitle' && ctx.coordinatorOnline) {
@@ -251,11 +321,16 @@
 						return true;
 					}
 				}
-				pendingSubtitleLabel = modalBtn.label || '';
-				interceptLog('step 1d: subtitle click — waiting for anchor intercept', {
-					label: modalBtn.label,
-					cachedCaptions: captions.map((c) => c.lanName || c.lan)
-				});
+				if (!captions.length) {
+					interceptLog('step 1d: cache empty — waiting for Download Options API response', { label: modalBtn.label });
+					retryLoadAndOpen(modalBtn, 'subtitle', ++subtitleRetryGen, Date.now());
+				} else {
+					pendingSubtitleLabel = modalBtn.label || '';
+					interceptLog('step 1d: subtitle click — waiting for anchor intercept', {
+						label: modalBtn.label,
+						cachedCaptions: captions.map((c) => c.lanName || c.lan)
+					});
+				}
 			}
 
 			if (!ctx.coordinatorOnline) {
@@ -283,6 +358,7 @@
 				return true;
 			}
 			pendingSubtitleLabel = '';
+			pendingQualityLabel = '';
 			interceptLog('step 5: opening Veloce format menu', formats[0]);
 			closeMenu();
 			openFormatMenu(location.href.split('#')[0], document.body, document.body, formats);

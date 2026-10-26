@@ -322,8 +322,9 @@
 			try {
 				if (!/instagram\.com/i.test(new URL(url).hostname)) return null;
 			} catch { return null; }
-			// Prefetch any resolvable post/reel URL — including feed cards — so badge
-			// clicks hit warm cache. Concurrency stays capped (PREFETCH_LIMIT=2).
+			// No prefetch while scrolling the feed — only once a post/reel/story is
+			// actually open in its own viewer (AGENTS.md: "No prefetch on Instagram feed").
+			if (isSocialFeedPage()) return false;
 			if (canonicalPostUrl(url)) return true;
 			if (isStoriesPage()) return !!canonicalStoryUrl();
 			return false;
