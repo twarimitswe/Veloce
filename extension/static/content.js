@@ -586,10 +586,36 @@
 	`;
 	shadow.appendChild(style);
 
+	// Entry-capped Map / Set. On a long infinite-scroll session these otherwise grow
+	// one entry per video/post ever seen and never shrink (localFormatCache holds
+	// format arrays; prefetchStarted / dismissedBadges hold URL keys). FIFO-evict
+	// the oldest on overflow — a re-prefetch or a re-shown dismissed badge after
+	// hundreds of items is harmless.
+	class BoundedMap extends Map {
+		constructor(cap) { super(); this._cap = cap; }
+		set(k, v) {
+			if (!this.has(k) && this.size >= this._cap) {
+				const o = this.keys().next().value;
+				if (o !== undefined) this.delete(o);
+			}
+			return super.set(k, v);
+		}
+	}
+	class BoundedSet extends Set {
+		constructor(cap) { super(); this._cap = cap; }
+		add(v) {
+			if (!this.has(v) && this.size >= this._cap) {
+				const o = this.values().next().value;
+				if (o !== undefined) this.delete(o);
+			}
+			return super.add(v);
+		}
+	}
+
 	const badges = new Map(); // badgeKey -> { el, anchor, root, rawUrl, resolvedUrl, labelEl }
 	const badgeKeys = new Set();
-	const localFormatCache = new Map();
-	const prefetchStarted = new Set();
+	const localFormatCache = new BoundedMap(200);
+	const prefetchStarted = new BoundedSet(400);
 	const MAX_PREFETCH_BATCH = 8;
 	const BADGE_MARGIN_PX = 200;
 	/** Prefetch uses same margin as badges — start loading formats when the badge appears. */
@@ -601,7 +627,7 @@
 	let pendingMenuEpoch = 0;
 	let menuEpoch = 0;
 	/** User dismissed badge for this URL — do not recreate until navigation/video change. */
-	const dismissedBadges = new Set();
+	const dismissedBadges = new BoundedSet(400);
 	let pendingLinkIntercept = null;
 	let menuDownloadChosen = false;
 	let linkInterceptBypassUntil = 0;

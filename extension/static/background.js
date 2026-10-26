@@ -29,11 +29,33 @@ let settings = null;
 const pendingFormatRequests = new Map(); // requestId -> { sendResponse, url? }
 const NOTIF_ICON = 'icons/icon-128.png';
 
+/**
+ * Map with a hard entry cap. The service worker can stay alive across a long
+ * browsing session; without a cap `formatCache` / `formatFailCache` accumulate
+ * one entry per video/post ever hovered (each holding multi-KB signed CDN URLs)
+ * and never shrink. FIFO-evict the oldest key on overflow. Per-entry TTL is still
+ * checked on read so stale entries never surface — this only bounds footprint.
+ */
+class BoundedMap extends Map {
+	constructor(capacity) {
+		super();
+		this._cap = capacity;
+	}
+	set(key, value) {
+		if (!this.has(key) && this.size >= this._cap) {
+			const oldest = this.keys().next().value;
+			if (oldest !== undefined) this.delete(oldest);
+		}
+		return super.set(key, value);
+	}
+}
+
 const FORMAT_CACHE_TTL_MS = 10 * 60 * 1000;
 const FORMAT_FAIL_TTL_MS = 5 * 60 * 1000;
 const PREFETCH_FAIL_TTL_MS = 45 * 1000;
-const formatCache = new Map(); // normalized url -> { formats, ts }
-const formatFailCache = new Map(); // normalized url -> { ts, prefetch?: boolean }
+const FORMAT_CACHE_MAX = 300;
+const formatCache = new BoundedMap(FORMAT_CACHE_MAX); // normalized url -> { formats, ts }
+const formatFailCache = new BoundedMap(FORMAT_CACHE_MAX); // normalized url -> { ts, prefetch?: boolean }
 const inflightFormatUrls = new Set();
 const prefetchQueue = [];
 const prefetchQueued = new Set();
@@ -1116,13 +1138,6 @@ chrome.downloads.onCreated.addListener(async (item) => {
 		return;
 	}
 
-	try {
-		await chrome.downloads.cancel(item.id);
-		interceptLog('step B: cancelled native browser download', { id: item.id });
-	} catch (e) {
-		interceptLog('step B: cancel failed', e?.message);
-	}
-
 	const listUrl = resolveInterceptListUrl(pageUrl, url);
 	interceptLog('step C: routing to format menu in tab', {
 		listUrl,
@@ -1134,13 +1149,27 @@ chrome.downloads.onCreated.addListener(async (item) => {
 		trapUrl: isInterceptTrapUrl(url)
 	});
 
+	// Open the Veloce menu FIRST. Only cancel the native download once we know the
+	// menu is up — otherwise a tab with no content script (just opened, or orphaned
+	// by an extension reload) loses the download entirely with nothing to replace it.
 	const opened = await openInterceptFormatMenu(item.tabId, {
 		pageUrl: pageUrl || url,
 		interceptUrl: url,
 		listUrl,
 		fileName
 	});
-	interceptLog(opened ? 'step D: format menu message sent' : 'step D: FAILED to open format menu', { tabId: item.tabId });
+	if (!opened) {
+		interceptLog('step D: FAILED to open format menu — leaving native download running', { tabId: item.tabId });
+		return;
+	}
+
+	try {
+		await chrome.downloads.cancel(item.id);
+		interceptLog('step B: cancelled native browser download (menu is up)', { id: item.id });
+	} catch (e) {
+		interceptLog('step B: cancel failed', e?.message);
+	}
+	interceptLog('step D: format menu message sent', { tabId: item.tabId });
 });
 
 // Relay from the persistent offscreen WebSocket holder.
