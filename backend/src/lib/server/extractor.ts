@@ -95,10 +95,65 @@ const EXTRACTOR_DOMAINS = [
 	'twitter.com', 'x.com', 'vimeo.com', 'facebook.com', 'twitch.tv', 'mediafire.com'
 ];
 
+/**
+ * Insertion-ordered map with a hard entry cap. Prevents the in-memory caches
+ * from growing without bound over a long-running coordinator process: on insert
+ * of a new key past `capacity`, the oldest entry is evicted (FIFO). Per-entry
+ * TTL is still enforced by callers on read, so stale entries never surface —
+ * this only bounds total footprint.
+ */
+class BoundedMap<K, V> extends Map<K, V> {
+	constructor(private readonly capacity: number) {
+		super();
+	}
+	set(key: K, value: V): this {
+		if (!this.has(key) && this.size >= this.capacity) {
+			const oldest = this.keys().next().value as K | undefined;
+			if (oldest !== undefined) this.delete(oldest);
+		}
+		return super.set(key, value);
+	}
+}
+
+/**
+ * Global cap on concurrent yt-dlp child processes across every path (format
+ * races, best-URL extraction, playlist listing, merge downloads). Without this,
+ * a `force:true` badge click during two prefetches plus a merge job could spawn
+ * a dozen `yt-dlp -J` processes at once (~50–150 MB RSS each) and thrash a
+ * low-RAM machine into the 50 s SW timeout. Extra attempts queue instead.
+ */
+const YTDLP_MAX_CONCURRENT = 3;
+let ytdlpActive = 0;
+const ytdlpWaiters: Array<() => void> = [];
+/** Largest yt-dlp stdout we will buffer before killing the child (JSON blowout guard). */
+const YTDLP_MAX_STDOUT_BYTES = 24 * 1024 * 1024;
+
+function acquireYtdlpSlot(): Promise<() => void> {
+	return new Promise<void>((resolve) => {
+		if (ytdlpActive < YTDLP_MAX_CONCURRENT) {
+			ytdlpActive++;
+			resolve();
+		} else {
+			ytdlpWaiters.push(() => {
+				ytdlpActive++;
+				resolve();
+			});
+		}
+	}).then(() => {
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			ytdlpActive--;
+			ytdlpWaiters.shift()?.();
+		};
+	});
+}
+
 const FORMAT_CACHE_TTL_MS = 10 * 60 * 1000;
 const FAIL_CACHE_TTL_MS = 90 * 1000;
-const formatCache = new Map<string, { formats: MediaFormat[]; ts: number }>();
-const failCache = new Map<string, { reason: string; ts: number; source?: MediaSource }>();
+const formatCache = new BoundedMap<string, { formats: MediaFormat[]; ts: number }>(400);
+const failCache = new BoundedMap<string, { reason: string; ts: number; source?: MediaSource }>(400);
 const inflight = new Map<string, Promise<MediaFormat[]>>();
 
 /** Browsers to try for cookie auth — chrome first (most users log in there). */
@@ -173,7 +228,7 @@ const INSTAGRAM_FAIL_CACHE_TTL_MS = 5 * 60 * 1000;
  */
 const BEST_URL_CACHE_TTL_MS = 10 * 60 * 1000; // same as format cache
 const IG_DIRECT_URL_CACHE_TTL_MS = 5 * 60 * 1000; // Instagram URLs expire faster
-const bestUrlCache = new Map<string, { url: string; ts: number }>();
+const bestUrlCache = new BoundedMap<string, { url: string; ts: number }>(400);
 
 /** Prefer Best row; else first format with a usable URL. */
 function seedBestUrlFromFormats(cacheKey: string, formats: MediaFormat[]): void {
@@ -444,13 +499,15 @@ async function raceInstagramFormats(url: string, force: boolean): Promise<Format
 		`[Extractor] Instagram list start force=${force} variants=${urls.length} url=${primaryUrl}`
 	);
 
-	const tryOne = async (
+	// Returns the live run handle alongside the settling promise so a race can
+	// kill() this attempt early — mirrors raceYoutubeFormats/raceGenericYtDlpFormats.
+	const tryOne = (
 		pageUrl: string,
 		browser: string
-	): Promise<{ formats: MediaFormat[]; err: string }> => {
+	): { kill: () => void; promise: Promise<{ formats: MediaFormat[]; err: string }> } => {
 		if (browser && cookieBrowserSkip.has(browser)) {
 			console.log(`[Extractor] Instagram skip ${browser} (already marked bad)`);
-			return { formats: [], err: '' };
+			return { kill: () => {}, promise: Promise.resolve({ formats: [], err: '' }) };
 		}
 		const label = browser || 'no-cookies';
 		const cookieArgs = browser ? ['--cookies-from-browser', browser] : [];
@@ -459,14 +516,16 @@ async function raceInstagramFormats(url: string, force: boolean): Promise<Format
 			allowPlaylist: true,
 			label: `instagram/${label}`
 		});
-		const formats = tagFormats(await run.promise, 'instagram');
-		run.kill();
-		const err = run.getError();
-		if (err && browser) markCookieBrowserBad(browser, err);
-		console.log(
-			`[Extractor] Instagram done ${label}: formats=${formats.length}${err ? ` err=${err.slice(0, 100)}` : ''}`
-		);
-		return { formats, err: err || '' };
+		const promise = run.promise.then((raw) => {
+			const formats = tagFormats(raw, 'instagram');
+			const err = run.getError();
+			if (err && browser) markCookieBrowserBad(browser, err);
+			console.log(
+				`[Extractor] Instagram done ${label}: formats=${formats.length}${err ? ` err=${err.slice(0, 100)}` : ''}`
+			);
+			return { formats, err: err || '' };
+		});
+		return { kill: run.kill, promise };
 	};
 
 	// Primary first; rebuild fallbacks AFTER skip so Chrome is not spawned twice.
@@ -476,7 +535,7 @@ async function raceInstagramFormats(url: string, force: boolean): Promise<Format
 	let lastErr = '';
 	const primaryBrowser = browsers[0] ?? '';
 	{
-		const { formats, err } = await tryOne(primaryUrl, primaryBrowser);
+		const { formats, err } = await tryOne(primaryUrl, primaryBrowser).promise;
 		if (formats.length) {
 			console.log(`[Extractor] Instagram OK via ${primaryBrowser || 'no-cookies'} (${formats.length} raw)`);
 			return { formats, lastErr: '' };
@@ -497,7 +556,9 @@ async function raceInstagramFormats(url: string, force: boolean): Promise<Format
 	}
 	fallbackJobs.push({ pageUrl: primaryUrl, browser: '' });
 
-	const capped = fallbackJobs.slice(0, 5);
+	// yt-dlp spawns are semaphore-limited (YTDLP_MAX_CONCURRENT); keep the queued
+	// fallback set modest so a stale queue doesn't hold work long after a win.
+	const capped = fallbackJobs.slice(0, 4);
 	console.log(
 		`[Extractor] Instagram fallbacks (${capped.length}): ${capped
 			.map((j) => `${j.browser || 'no-cookies'}@${j.pageUrl.includes('/reel/') ? 'reel' : 'p'}`)
@@ -506,19 +567,23 @@ async function raceInstagramFormats(url: string, force: boolean): Promise<Format
 
 	if (!capped.length) return { formats: [], lastErr };
 
-	const runners = capped.map((job) => ({
-		job,
-		promise: tryOne(job.pageUrl, job.browser)
-	}));
+	const runners = capped.map((job) => {
+		const { kill, promise } = tryOne(job.pageUrl, job.browser);
+		return { job, kill, promise };
+	});
 
 	return new Promise((resolve) => {
 		let finished = 0;
 		let resolved = false;
 		let bestErr = lastErr;
 
+		// Stop the other in-flight yt-dlp/cookie-decrypt spawns the instant one
+		// fallback wins — previously they ran to completion (up to timeoutMs)
+		// for a discarded result, each holding a semaphore slot + RSS for nothing.
 		const finishAll = (formats: MediaFormat[], via: string) => {
 			if (resolved) return;
 			resolved = true;
+			for (const r of runners) r.kill();
 			console.log(
 				`[Extractor] Instagram race end via=${via} formats=${formats.length} lastErr=${(bestErr || '').slice(0, 80)}`
 			);
@@ -583,7 +648,7 @@ async function raceYoutubeFormats(url: string, force: boolean): Promise<FormatLi
 		if (primaryFormats.length) return { formats: primaryFormats, lastErr: '' };
 	}
 
-	const fallbacks = attempts.slice(1, 5);
+	const fallbacks = attempts.slice(1, 4);
 	if (!fallbacks.length) return { formats: [], lastErr };
 
 	const runners = fallbacks.map((attempt) =>
@@ -683,10 +748,18 @@ function runYtDlpJson(
 	let proc: ChildProcess | null = null;
 	let lastErr = '';
 	let killTimer: ReturnType<typeof setTimeout> | null = null;
+	// `done` is assigned inside the executor; `kill` (returned synchronously) and
+	// the semaphore-release path both need to reach it.
+	let doneFn: (result: MediaFormat[]) => void = () => {};
 
 	const kill = () => {
+		if (!proc) {
+			// Killed while still queued for a yt-dlp slot — abandon without spawning.
+			doneFn([]);
+			return;
+		}
 		try {
-			proc?.kill('SIGTERM');
+			proc.kill('SIGTERM');
 		} catch { /* ignore */ }
 		// Cookie-decrypt hangs ignore SIGTERM — escalate quickly.
 		if (killTimer) clearTimeout(killTimer);
@@ -717,21 +790,23 @@ function runYtDlpJson(
 			args.splice(args.length - 2, 0, '--no-playlist');
 		}
 
-		proc = spawn(ytdlpPath, args);
-
 		let output = '';
 		let settled = false;
+		let releaseSlot: () => void = () => {};
+		let timeout: ReturnType<typeof setTimeout> | null = null;
 		const done = (result: MediaFormat[]) => {
 			if (settled) return;
 			settled = true;
-			clearTimeout(timeout);
+			if (timeout) clearTimeout(timeout);
 			if (killTimer) {
 				clearTimeout(killTimer);
 				killTimer = null;
 			}
+			releaseSlot();
 			if (!result.length && lastErr && opts.label) {
 				const logKey = `${opts.label}:${url}`;
 				if (!ytDlpErrorLogged.has(logKey)) {
+					if (ytDlpErrorLogged.size > 500) ytDlpErrorLogged.clear();
 					ytDlpErrorLogged.add(logKey);
 					console.error(`[yt-dlp formats/${opts.label}]: ${lastErr}`);
 					setTimeout(() => ytDlpErrorLogged.delete(logKey), 120_000);
@@ -739,45 +814,64 @@ function runYtDlpJson(
 			}
 			resolve(result);
 		};
+		doneFn = done;
 
-		const timeout = setTimeout(() => {
-			kill();
-			done([]);
-		}, timeoutMs);
+		void acquireYtdlpSlot().then((release) => {
+			releaseSlot = release;
+			if (settled) {
+				// kill()/timeout fired while we were queued — give the slot back.
+				release();
+				return;
+			}
 
-		proc.stdout?.on('data', (data) => { output += data.toString(); });
-		proc.stderr?.on('data', (data) => {
-			const text = data.toString();
-			for (const rawLine of text.split('\n')) {
-				const line = rawLine.trim();
-				if (!line) continue;
-				if (line.startsWith('ERROR:')) {
-					lastErr = line.replace(/^ERROR:\s*/, '');
-				} else if (/secretstorage/i.test(line) || /could not find .* cookies database/i.test(line)) {
-					lastErr = line;
-					// Fail this attempt immediately — waiting the full timeout feels "infinite".
+			proc = spawn(ytdlpPath, args);
+
+			timeout = setTimeout(() => {
+				kill();
+				done([]);
+			}, timeoutMs);
+
+			proc.stdout?.on('data', (data) => {
+				output += data.toString();
+				if (output.length > YTDLP_MAX_STDOUT_BYTES) {
+					lastErr = lastErr || 'yt-dlp output exceeded the size limit';
 					kill();
+					done([]);
+				}
+			});
+			proc.stderr?.on('data', (data) => {
+				const text = data.toString();
+				for (const rawLine of text.split('\n')) {
+					const line = rawLine.trim();
+					if (!line) continue;
+					if (line.startsWith('ERROR:')) {
+						lastErr = line.replace(/^ERROR:\s*/, '');
+					} else if (/secretstorage/i.test(line) || /could not find .* cookies database/i.test(line)) {
+						lastErr = line;
+						// Fail this attempt immediately — waiting the full timeout feels "infinite".
+						kill();
+						done([]);
+						return;
+					}
+				}
+			});
+
+			proc.on('close', () => {
+				if (!output.trim()) {
 					done([]);
 					return;
 				}
-			}
-		});
+				try {
+					const parsed = parseYtDlpFormats(output);
+					done(parsed);
+				} catch (e) {
+					console.error('[Extractor] Failed to parse yt-dlp JSON', e);
+					done([]);
+				}
+			});
 
-		proc.on('close', () => {
-			if (!output.trim()) {
-				done([]);
-				return;
-			}
-			try {
-				const parsed = parseYtDlpFormats(output);
-				done(parsed);
-			} catch (e) {
-				console.error('[Extractor] Failed to parse yt-dlp JSON', e);
-				done([]);
-			}
+			proc.on('error', () => done([]));
 		});
-
-		proc.on('error', () => done([]));
 	});
 
 	return { promise, kill, getError };
@@ -944,10 +1038,10 @@ function formatsFromInfo(info: Record<string, unknown>, title: string): MediaFor
 const MF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 /** Short TTL cache so enqueue + engine-start don't double-scrape (~5s → ~0 on hit). */
-const mediafireCdnCache = new Map<
+const mediafireCdnCache = new BoundedMap<
 	string,
 	{ url: string; at: number; fileName?: string; sizeBytes?: number }
->();
+>(200);
 const MEDIAFIRE_CDN_TTL_MS = 90_000;
 
 function mediafireCacheKey(url: string): string {
@@ -1418,6 +1512,7 @@ export function startMergedYtDlpDownload(
 				pageUrl
 			];
 
+			const mergeSlot = await acquireYtdlpSlot();
 			const result = await new Promise<MergedDownloadResult>((resolve) => {
 				const proc = spawn(ytdlpPath, args, { stdio: ['ignore', 'ignore', 'pipe'] });
 				current = proc;
@@ -1451,7 +1546,7 @@ export function startMergedYtDlpDownload(
 					if (browser) markCookieBrowserBad(browser, errText);
 					resolve({ ok: false, error: errText.slice(0, 240) });
 				});
-			});
+			}).finally(() => mergeSlot());
 
 			if (result.ok) return result;
 			lastErr = result.error;
@@ -1526,6 +1621,23 @@ export async function listPlaylistEntries(url: string): Promise<PlaylistEntry[]>
 function runYtDlpPlaylistJson(url: string, cookieArgs: string[]): Promise<ResolvedPlaylist | null> {
 	return new Promise((resolve) => {
 		const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
+		let settled = false;
+		let releaseSlot: () => void = () => {};
+		let timeout: ReturnType<typeof setTimeout> | null = null;
+		const done = (result: ResolvedPlaylist | null) => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			releaseSlot();
+			resolve(result);
+		};
+
+		void acquireYtdlpSlot().then((release) => {
+		releaseSlot = release;
+		if (settled) {
+			release();
+			return;
+		}
 		const proc = spawn(ytdlpPath, [
 			...ytdlpSharedArgs(),
 			...cookieArgs,
@@ -1540,19 +1652,18 @@ function runYtDlpPlaylistJson(url: string, cookieArgs: string[]): Promise<Resolv
 		]);
 
 		let output = '';
-		let settled = false;
-		const done = (result: ResolvedPlaylist | null) => {
-			if (settled) return;
-			settled = true;
-			clearTimeout(timeout);
-			resolve(result);
-		};
-		const timeout = setTimeout(() => {
+		timeout = setTimeout(() => {
 			try { proc.kill('SIGTERM'); } catch { /* ignore */ }
 			done(null);
 		}, 90_000);
 
-		proc.stdout?.on('data', (d) => { output += d.toString(); });
+		proc.stdout?.on('data', (d) => {
+			output += d.toString();
+			if (output.length > YTDLP_MAX_STDOUT_BYTES) {
+				try { proc.kill('SIGTERM'); } catch { /* ignore */ }
+				done(null);
+			}
+		});
 		proc.on('error', () => done(null));
 		proc.on('close', () => {
 			if (!output.trim()) return done(null);
@@ -1582,6 +1693,7 @@ function runYtDlpPlaylistJson(url: string, cookieArgs: string[]): Promise<Resolv
 			} catch {
 				done(null);
 			}
+		});
 		});
 	});
 }
@@ -1646,54 +1758,68 @@ export async function extractMediaUrl(url: string): Promise<string | null> {
 function runYtDlp(url: string, cookieArgs: string[], format: string): Promise<string | null> {
     return new Promise((resolve) => {
         const ytdlpPath = path.resolve(process.cwd(), 'bin', 'yt-dlp');
-        const ytdlp = spawn(ytdlpPath, [
-            ...ytdlpSharedArgs(),
-            ...cookieArgs,
-            '-f', format,
-            '--no-playlist',
-            '--no-warnings',
-            '--no-progress',
-            '--socket-timeout', '12',
-            '--retries', '1',
-            '-g',
-            '--',
-            url
-        ]);
-
-        let output = '';
         let settled = false;
+        let releaseSlot: () => void = () => {};
+        let timeout: ReturnType<typeof setTimeout> | null = null;
         const done = (result: string | null) => {
             if (settled) return;
             settled = true;
-            clearTimeout(timeout);
+            if (timeout) clearTimeout(timeout);
+            releaseSlot();
             resolve(result);
         };
 
-        const timeout = setTimeout(() => {
-            ytdlp.kill();
-            console.error(`[yt-dlp] Timed out after 30s for: ${url}`);
-            done(null);
-        }, 30_000);
-
-        ytdlp.stdout.on('data', (data) => {
-            output += data.toString();
-        });
-
-        ytdlp.stderr.on('data', (data) => {
-            console.error(`[yt-dlp log]: ${data.toString().trim()}`);
-        });
-
-        ytdlp.on('close', (code) => {
-            if (code === 0 && output.trim()) {
-                done(output.trim().split('\n')[0]);
-            } else {
-                done(null);
+        void acquireYtdlpSlot().then((release) => {
+            releaseSlot = release;
+            if (settled) {
+                release();
+                return;
             }
-        });
+            const ytdlp = spawn(ytdlpPath, [
+                ...ytdlpSharedArgs(),
+                ...cookieArgs,
+                '-f', format,
+                '--no-playlist',
+                '--no-warnings',
+                '--no-progress',
+                '--socket-timeout', '12',
+                '--retries', '1',
+                '-g',
+                '--',
+                url
+            ]);
 
-        ytdlp.on('error', (err) => {
-            console.error('yt-dlp error (is it installed?):', err);
-            done(null);
+            let output = '';
+            timeout = setTimeout(() => {
+                ytdlp.kill();
+                console.error(`[yt-dlp] Timed out after 30s for: ${url}`);
+                done(null);
+            }, 30_000);
+
+            ytdlp.stdout.on('data', (data) => {
+                output += data.toString();
+                if (output.length > YTDLP_MAX_STDOUT_BYTES) {
+                    ytdlp.kill();
+                    done(null);
+                }
+            });
+
+            ytdlp.stderr.on('data', (data) => {
+                console.error(`[yt-dlp log]: ${data.toString().trim()}`);
+            });
+
+            ytdlp.on('close', (code) => {
+                if (code === 0 && output.trim()) {
+                    done(output.trim().split('\n')[0]);
+                } else {
+                    done(null);
+                }
+            });
+
+            ytdlp.on('error', (err) => {
+                console.error('yt-dlp error (is it installed?):', err);
+                done(null);
+            });
         });
     });
 }

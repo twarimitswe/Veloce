@@ -22,7 +22,7 @@ console.log = (...args) => logWithTime(origLog, ...args);
 console.error = (...args) => logWithTime(origError, ...args);
 console.warn = (...args) => logWithTime(origWarn, ...args);
 
-import { extractMediaUrl, extractMediaWithFormat, listFormats, getRecentFormatError, isDirectFileUrl, isManifestFormatUrl, isInstagramMediaPageUrl, startMergedYtDlpDownload, isInstagramSilentDashUrl } from './extractor';
+import { extractMediaUrl, extractMediaWithFormat, listFormats, getRecentFormatError, isDirectFileUrl, isManifestFormatUrl, isInstagramMediaPageUrl, startMergedYtDlpDownload, isInstagramSilentDashUrl, removeBestUrlCache } from './extractor';
 import { detectMediaSource } from './formatSources';
 import {
 	defaultPlaylistFormatSettings,
@@ -148,6 +148,15 @@ interface JobSpec {
 	directUrl?: string;
 	/** Browser referer for signed CDN URLs. */
 	referer?: string;
+	/** Internal: set once we have already re-extracted after a stale-CDN failure. */
+	cdnRetried?: boolean;
+}
+
+/** Engine failure text that means "the direct URL we were given is dead" (expired token / ranges pulled). */
+function looksLikeStaleCdnFailure(log: string): boolean {
+	return /ignored Range|CDN token expired|ranges disabled|expired or ranges|\b403\b|forbidden/i.test(
+		log || ''
+	);
 }
 
 // ── Connected clients (broadcast target) ─────────────────────────────────────
@@ -794,6 +803,34 @@ async function runDownloadJob(spec: JobSpec): Promise<void> {
 					code === 0
 						? undefined
 						: lastEngineError || fromStderr || `Engine exited with code ${code}`;
+
+				// A `directUrl` handed to us from a warm format cache can be an
+				// expired signed CDN link by the time the job runs. Re-extract
+				// once from the page URL and retry in the same scheduler slot
+				// before surfacing the failure to the user.
+				if (
+					code !== 0 &&
+					spec.directUrl &&
+					!spec.cdnRetried &&
+					looksLikeStaleCdnFailure(`${stderrTail}\n${errMsg ?? ''}`)
+				) {
+					console.warn(
+						`[Veloce] Direct URL looked stale for ${id}; re-extracting from page and retrying once.`
+					);
+					removeBestUrlCache(spec.pageUrl);
+					try {
+						await runDownloadJob({
+							...spec,
+							directUrl: undefined,
+							cdnRetried: true,
+							allowRename: false
+						});
+					} finally {
+						resolveProc();
+					}
+					return;
+				}
+
 				await settle(code === 0 ? 'completed' : 'error', errMsg);
 			}
 		});
@@ -1036,6 +1073,22 @@ async function reconcileInterrupted() {
 		if (stuck.length === 0) return;
 		for (const row of stuck) {
 			migrateLegacySidecars(row.savePath);
+			// Only auto-resume rows that actually made progress. A row with no
+			// bytes, no partial file and no resume state is likely a job that
+			// fails immediately (dead URL, missing engine, bad cookies) — re-running
+			// it on every coordinator start just re-fails it silently. Surface it
+			// so the user retries deliberately.
+			const madeProgress =
+				(row.downloadedBytes ?? 0) > 0 ||
+				hasResumeState(row.savePath) ||
+				existsSync(row.savePath);
+			if (!madeProgress) {
+				await markError(
+					row.id,
+					'Interrupted before any data downloaded — click Retry.'
+				);
+				continue;
+			}
 			await setStatus(row.id, 'queued');
 			scheduleDownload(() => runDownloadJob(specFromRow(row)));
 		}
